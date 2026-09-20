@@ -1,0 +1,8 @@
+{
+  "name": "READVERSE",
+  "description": "Vũ trụ đọc sách và tư duy phản biện tương tác dành cho học sinh - Mỗi trang sách mở ra một vũ trụ.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
