@@ -3,6 +3,7 @@ import { GitCommit, Sparkles, Plus, Check, Award, ArrowRight, Share2, Layers, Bo
 import { ConstellationItem, UserProfile } from "../../types";
 import { SUGGESTED_READING_WORKS } from "../../data/mockData";
 import { playPop, playSuccess, playTwinkle } from "../../utils/audio";
+import { apiFetch } from "../../utils/apiClient";
 
 interface ConnectPlanetProps {
   user: UserProfile;
@@ -208,16 +209,26 @@ export const ConnectPlanet: React.FC<ConnectPlanetProps> = ({
       .filter(Boolean) as string[];
 
     try {
-      const res = await fetch("/api/connect/evaluate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          nodes: selectedLabels,
-          insight: connectionInsight,
-          connectionReason: connectionInsight,
-        }),
-      });
-      const data = await res.json();
+      const fallbackResult = {
+        depthScore: 90,
+        feedback: "Liên kết giàu sức gợi giữa tác phẩm và thực tế đời sống! Bạn đã tìm ra mẫu số chung của tình người và hy vọng.",
+        constellationTitle: customConstellationName || "Chòm Sao Thấu Cảm",
+        unlockedStar: "Sao Thiên Trí",
+      };
+
+      const data = await apiFetch<any>(
+        "/api/connect/evaluate",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            nodes: selectedLabels,
+            insight: connectionInsight,
+            connectionReason: connectionInsight,
+          }),
+        },
+        fallbackResult
+      );
+
       setEvaluationResult(data);
       playSuccess();
 
@@ -235,33 +246,6 @@ export const ConnectPlanet: React.FC<ConnectPlanetProps> = ({
       onActivityComplete(
         `Dệt chòm sao: ${newConstellation.name}`,
         data.depthScore || 92,
-        "Kiến Trúc Sư Ngân Hà",
-        "connect"
-      );
-    } catch {
-      const fallback = {
-        depthScore: 90,
-        feedback: "Liên kết giàu sức gợi giữa tác phẩm và thực tế đời sống! Bạn đã tìm ra mẫu số chung của tình người và hy vọng.",
-        constellationTitle: customConstellationName || "Chòm Sao Thấu Cảm",
-        unlockedStar: "Sao Thiên Trí",
-      };
-      setEvaluationResult(fallback);
-      playSuccess();
-
-      const newConstellation: ConstellationItem = {
-        id: "c-user-" + Date.now(),
-        name: customConstellationName || "Chòm Sao Thấu Cảm",
-        connectedThemes: selectedLabels,
-        description: connectionInsight,
-        unlockedAt: "Hôm nay",
-        color: "#2dd4bf",
-      };
-
-      if (onAddConstellation) onAddConstellation(newConstellation);
-
-      onActivityComplete(
-        `Dệt chòm sao: ${newConstellation.name}`,
-        90,
         "Kiến Trúc Sư Ngân Hà",
         "connect"
       );

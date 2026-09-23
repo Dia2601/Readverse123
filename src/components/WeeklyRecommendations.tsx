@@ -3,6 +3,7 @@ import { Sparkles, BookOpen, Compass, Bookmark, Check, RefreshCw, HelpCircle, Qu
 import { BookRecommendation, UserProfile } from "../types";
 import { INITIAL_RECOMMENDATIONS } from "../data/mockData";
 import { playPop, playSuccess, playTwinkle } from "../utils/audio";
+import { apiFetch } from "../utils/apiClient";
 
 interface WeeklyRecommendationsProps {
   user: UserProfile;
@@ -21,16 +22,20 @@ export const WeeklyRecommendations: React.FC<WeeklyRecommendationsProps> = ({
     setIsLoading(true);
     playTwinkle();
     try {
-      const res = await fetch("/api/recommendations", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          interests: user.interests,
-          readWorks: user.readWorks,
-          readingStyle: user.readingStyle,
-        }),
-      });
-      const data = await res.json();
+      const data = await apiFetch<{ recommendations?: BookRecommendation[] }>(
+        "/api/recommendations",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            interests: user.interests,
+            readWorks: user.readWorks,
+            readingStyle: user.readingStyle,
+          }),
+          timeoutMs: 12000,
+        },
+        { recommendations: INITIAL_RECOMMENDATIONS }
+      );
+
       if (Array.isArray(data.recommendations) && data.recommendations.length > 0) {
         setRecommendations(data.recommendations);
       }

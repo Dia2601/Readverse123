@@ -30,6 +30,7 @@ import {
 import { getCanonicalWork, CanonicalWorkMetadata } from "../../data/canonicalWorksData";
 import { syncPerspectiveToServer, saveLocalPerspective } from "../../utils/perspectiveManager";
 import { playPop, playSuccess, playTwinkle, playWarp } from "../../utils/audio";
+import { apiFetch } from "../../utils/apiClient";
 
 interface StoryReconstructionProps {
   user?: UserProfile;
@@ -124,48 +125,52 @@ export const StoryReconstruction: React.FC<StoryReconstructionProps> = ({
     setAiError(null);
     playTwinkle();
 
-    try {
-      const res = await fetch("/api/create/story-partner", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          originalWork: canonicalData.title,
-          author: canonicalData.author,
-          characters: canonicalData.characters,
-          context: canonicalData.context,
-          turningPoint: selectedTurningPoint,
-          originalSituationSummary: canonicalData.originalSituationSummary,
-          storyBranches: branches,
-          userDraft: currentIdeaDraft,
-        }),
-      });
+    const fallbackAdvice: AIStoryPartnerAdvice = {
+      ideaOpens: `Ý tưởng của bạn mở ra một chân trời mới cho nhân vật trong "${canonicalData.title}": biến đổi sự cam chịu thành hành động tự cứu lấy phẩm giá.`,
+      rationalPoints: [
+        `Tính cách của nhân vật vốn giàu tình thương và lòng tự trọng sâu kín.`,
+        `Bước ngoặt logic và giàu sức gợi đối với hoàn cảnh đương thời.`,
+      ],
+      considerations: [
+        `Cần chú ý định kiến giai cấp và áp lực xã hội thời điểm đó.`,
+        `Tạo chuyển biến tâm lý từng nấc để giữ được chất chân thực.`,
+      ],
+      growthSuggestions: [
+        `Viết một câu đối thoại then chốt giữa hai nhân vật khi sự việc đảo chiều.`,
+        `Mô tả một chi tiết ngoại cảnh (ngọn lửa, ánh trăng, gió lạnh) đồng điệu với nội tâm.`,
+      ],
+      openQuestions: [
+        `Nhân vật sẽ đối diện với sự ngỡ ngàng của những người xung quanh ra sao?`,
+        `Bài học sâu sắc nhất mà bạn muốn gửi gắm qua kết cục này là gì?`,
+      ],
+    };
 
-      if (!res.ok) throw new Error("Phản hồi AI không thành công");
-      const data: AIStoryPartnerAdvice = await res.json();
+    try {
+      const data = await apiFetch<AIStoryPartnerAdvice>(
+        "/api/create/story-partner",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            originalWork: canonicalData.title,
+            author: canonicalData.author,
+            characters: canonicalData.characters,
+            context: canonicalData.context,
+            turningPoint: selectedTurningPoint,
+            originalSituationSummary: canonicalData.originalSituationSummary,
+            storyBranches: branches,
+            userDraft: currentIdeaDraft,
+          }),
+          timeoutMs: 14000,
+        },
+        fallbackAdvice
+      );
+
       setAiPartnerAdvice(data);
       playSuccess();
     } catch (err) {
       console.warn("AI Story Partner fallback:", err);
       setAiError("Đường truyền với trạm AI Komi gián đoạn tạm thời. Bạn vẫn có thể tiếp tục viết và lưu câu chuyện tự do!");
-      setAiPartnerAdvice({
-        ideaOpens: `Ý tưởng của bạn mở ra một chân trời mới cho nhân vật trong "${canonicalData.title}": biến đổi sự cam chịu thành hành động tự cứu lấy phẩm giá.`,
-        rationalPoints: [
-          `Tính cách của nhân vật vốn giàu tình thương và lòng tự trọng sâu kín.`,
-          `Bước ngoặt logic và giàu sức gợi đối với hoàn cảnh đương thời.`,
-        ],
-        considerations: [
-          `Cần chú ý định kiến giai cấp và áp lực xã hội thời điểm đó.`,
-          `Tạo chuyển biến tâm lý từng nấc để giữ được chất chân thực.`,
-        ],
-        growthSuggestions: [
-          `Viết một câu đối thoại then chốt giữa hai nhân vật khi sự việc đảo chiều.`,
-          `Mô tả một chi tiết ngoại cảnh (ngọn lửa, ánh trăng, gió lạnh) đồng điệu với nội tâm.`,
-        ],
-        openQuestions: [
-          `Nhân vật sẽ đối diện với sự ngỡ ngàng của những người xung quanh ra sao?`,
-          `Bài học sâu sắc nhất mà bạn muốn gửi gắm qua kết cục này là gì?`,
-        ],
-      });
+      setAiPartnerAdvice(fallbackAdvice);
       playSuccess();
     } finally {
       setIsConsultingAI(false);
@@ -270,26 +275,27 @@ export const StoryReconstruction: React.FC<StoryReconstructionProps> = ({
     // If publishing publicly, run AI Safety Check (Section XVI)
     if (visibilityChoice === "public") {
       try {
-        const safetyRes = await fetch("/api/create/safety-check", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            title: perspectiveTitle,
-            creativeContent: compiledContent,
-            originalWork: canonicalData.title,
-          }),
-        });
+        const safetyData = await apiFetch<{ isSafe: boolean; warning?: string }>(
+          "/api/create/safety-check",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              title: perspectiveTitle,
+              creativeContent: compiledContent,
+              originalWork: canonicalData.title,
+            }),
+            timeoutMs: 8000,
+          },
+          { isSafe: true }
+        );
 
-        if (safetyRes.ok) {
-          const safetyData = await safetyRes.json();
-          if (!safetyData.isSafe) {
-            setSafetyWarning(safetyData.warning || "Bản sáng tạo cần được chỉnh sửa trước khi công khai.");
-            setIsPublishing(false);
-            return;
-          }
+        if (!safetyData.isSafe) {
+          setSafetyWarning(safetyData.warning || "Bản sáng tạo cần được chỉnh sửa trước khi công khai.");
+          setIsPublishing(false);
+          return;
         }
       } catch (e) {
-        console.warn("Safety check check bypassed gracefully:", e);
+        console.warn("Safety check bypassed gracefully:", e);
       }
     }
 

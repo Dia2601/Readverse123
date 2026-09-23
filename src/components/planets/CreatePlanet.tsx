@@ -4,6 +4,7 @@ import { UserProfile, CreativePerspective } from "../../types";
 import { SUGGESTED_READING_WORKS } from "../../data/mockData";
 import { playPop, playSuccess, playTwinkle } from "../../utils/audio";
 import { StoryReconstruction } from "./StoryReconstruction";
+import { apiFetch } from "../../utils/apiClient";
 
 interface CreatePlanetProps {
   user: UserProfile;
@@ -169,20 +170,7 @@ export const CreatePlanet: React.FC<CreatePlanetProps> = ({
     playTwinkle();
 
     try {
-      const res = await fetch("/api/create/co-create-feedback", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          originalWork: selectedPrompt.originalWork,
-          promptTitle: selectedPrompt.title,
-          studentDraft: customText,
-        }),
-      });
-      const data = await res.json();
-      setCoCreateFeedback(data);
-      playSuccess();
-    } catch {
-      setCoCreateFeedback({
+      const fallbackFeedback = {
         voiceHighlight: "Giọng văn chân thành, câu từ mộc mạc và giàu cảm xúc.",
         emotionalImpact: "Truyền tải được nỗi trăn trở của nhân vật rất tốt.",
         imagerySuggestions: [
@@ -190,7 +178,22 @@ export const CreatePlanet: React.FC<CreatePlanetProps> = ({
           "Mô tả ánh mắt hay chuyển động bàn tay để tạo thêm điểm nhấn hình ảnh.",
         ],
         encouragement: "Đoạn văn của bạn đã có sức gợi rất tốt! Hãy tiếp tục mài giũa thêm chi tiết.",
-      });
+      };
+
+      const data = await apiFetch<any>(
+        "/api/create/co-create-feedback",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            originalWork: selectedPrompt.originalWork,
+            promptTitle: selectedPrompt.title,
+            studentDraft: customText,
+          }),
+        },
+        fallbackFeedback
+      );
+
+      setCoCreateFeedback(data);
       playSuccess();
     } finally {
       setIsAskingCoCreate(false);
@@ -205,16 +208,27 @@ export const CreatePlanet: React.FC<CreatePlanetProps> = ({
     playTwinkle();
 
     try {
-      const res = await fetch("/api/create/evaluate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          originalWork: selectedPrompt.originalWork,
-          promptTitle: selectedPrompt.title,
-          studentText: customText,
-        }),
-      });
-      const data = await res.json();
+      const fallbackEval = {
+        creativityScore: 92,
+        depthScore: 90,
+        feedback: "Tác phẩm sáng tạo xuất sắc! Bạn kết nối hài hòa giữa cảm xúc nhân vật và trí tưởng tượng tươi mới.",
+        characterPraise: "Tình cảm và ngôn từ thể hiện sự thấu cảm sâu sắc.",
+        badge: "Cây Bút Ngân Hà",
+      };
+
+      const data = await apiFetch<any>(
+        "/api/create/evaluate",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            originalWork: selectedPrompt.originalWork,
+            promptTitle: selectedPrompt.title,
+            studentText: customText,
+          }),
+        },
+        fallbackEval
+      );
+
       setArchiveResult(data);
       playSuccess();
 
@@ -232,33 +246,6 @@ export const CreatePlanet: React.FC<CreatePlanetProps> = ({
         `Sáng tác: ${selectedPrompt.title}`,
         Math.round(((data.creativityScore || 92) + (data.depthScore || 90)) / 2),
         data.badge || "Cây Bút Ngân Hà",
-        "create"
-      );
-    } catch {
-      const fallback = {
-        creativityScore: 92,
-        depthScore: 90,
-        feedback: "Tác phẩm sáng tạo xuất sắc! Bạn kết nối hài hòa giữa cảm xúc nhân vật và trí tưởng tượng tươi mới.",
-        characterPraise: "Tình cảm và ngôn từ thể hiện sự thấu cảm sâu sắc.",
-        badge: "Cây Bút Ngân Hà",
-      };
-      setArchiveResult(fallback);
-      playSuccess();
-
-      if (onSaveCreation) {
-        onSaveCreation({
-          id: "creation-" + Date.now(),
-          title: selectedPrompt.title,
-          workTitle: selectedPrompt.originalWork,
-          content: customText,
-          date: new Date().toLocaleDateString("vi-VN"),
-        });
-      }
-
-      onActivityComplete(
-        `Sáng tác: ${selectedPrompt.title}`,
-        91,
-        "Cây Bút Ngân Hà",
         "create"
       );
     } finally {

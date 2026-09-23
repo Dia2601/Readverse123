@@ -1,14 +1,158 @@
-import express, { Request, Response } from "express";
+import express, { Request, Response, NextFunction } from "express";
 import path from "path";
+import fs from "fs";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
 
+// Global unhandled error protection to prevent Node process termination
+process.on("uncaughtException", (err) => {
+  console.error("⚠️ [Process] Uncaught Exception trapped:", err?.message || err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("⚠️ [Process] Unhandled Rejection trapped:", reason);
+});
+
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json());
+// Body limit protection (prevents oversized payload DoS)
+app.use(express.json({ limit: "1mb" }));
+
+// Lightweight in-memory sliding window rate limiter
+interface RateLimitBucket {
+  count: number;
+  resetAt: number;
+}
+const ipRateLimits = new Map<string, RateLimitBucket>();
+const ipAiRateLimits = new Map<string, RateLimitBucket>();
+
+// Clean up expired buckets every 60s
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, bucket] of ipRateLimits.entries()) {
+    if (bucket.resetAt <= now) ipRateLimits.delete(ip);
+  }
+  for (const [ip, bucket] of ipAiRateLimits.entries()) {
+    if (bucket.resetAt <= now) ipAiRateLimits.delete(ip);
+  }
+}, 60000).unref();
+
+function apiRateLimiter(req: Request, res: Response, next: NextFunction) {
+  const ip = req.ip || req.socket.remoteAddress || "global";
+  const now = Date.now();
+  const bucket = ipRateLimits.get(ip);
+  if (!bucket || bucket.resetAt <= now) {
+    ipRateLimits.set(ip, { count: 1, resetAt: now + 60000 });
+    return next();
+  }
+  bucket.count++;
+  if (bucket.count > 240) {
+    res.setHeader("Retry-After", "5");
+    return res.status(429).json({ error: "Hệ thống đang phục vụ nhiều người dùng. Vui lòng thử lại sau 5 giây." });
+  }
+  next();
+}
+
+function aiRateLimiter(req: Request, res: Response, next: NextFunction) {
+  const ip = req.ip || req.socket.remoteAddress || "global";
+  const now = Date.now();
+  const bucket = ipAiRateLimits.get(ip);
+  if (!bucket || bucket.resetAt <= now) {
+    ipAiRateLimits.set(ip, { count: 1, resetAt: now + 60000 });
+    return next();
+  }
+  bucket.count++;
+  if (bucket.count > 36) {
+    // Flag request to immediately serve high quality cached/canonical response without overloading Gemini
+    (req as any)._forceFallback = true;
+  }
+  next();
+}
+
+app.use("/api", apiRateLimiter);
+
+// Server-side AI response caching (TTL + LRU)
+interface ServerCacheEntry {
+  data: any;
+  expiresAt: number;
+}
+const serverCache = new Map<string, ServerCacheEntry>();
+
+function getCachedResult<T>(key: string): T | null {
+  const entry = serverCache.get(key);
+  if (entry && entry.expiresAt > Date.now()) {
+    return entry.data as T;
+  }
+  return null;
+}
+
+function setCachedResult(key: string, data: any, ttlSeconds = 1800): void {
+  if (serverCache.size > 300) {
+    const now = Date.now();
+    for (const [k, v] of serverCache.entries()) {
+      if (v.expiresAt <= now) serverCache.delete(k);
+    }
+    if (serverCache.size > 300) {
+      const keys = Array.from(serverCache.keys()).slice(0, 50);
+      keys.forEach((k) => serverCache.delete(k));
+    }
+  }
+  serverCache.set(key, {
+    data,
+    expiresAt: Date.now() + ttlSeconds * 1000,
+  });
+}
+
+// Gemini Concurrency Controller (Semaphore + Queue)
+let activeGeminiCalls = 0;
+const MAX_CONCURRENT_GEMINI_CALLS = 4;
+const MAX_GEMINI_QUEUE = 16;
+type QueueItem = {
+  resolve: (value: boolean) => void;
+  queuedAt: number;
+};
+const geminiQueue: QueueItem[] = [];
+
+async function acquireGeminiSlot(): Promise<boolean> {
+  if (activeGeminiCalls < MAX_CONCURRENT_GEMINI_CALLS) {
+    activeGeminiCalls++;
+    return true;
+  }
+  if (geminiQueue.length >= MAX_GEMINI_QUEUE) {
+    return false;
+  }
+  return new Promise<boolean>((resolve) => {
+    const item: QueueItem = {
+      resolve,
+      queuedAt: Date.now(),
+    };
+    geminiQueue.push(item);
+
+    setTimeout(() => {
+      const idx = geminiQueue.indexOf(item);
+      if (idx !== -1) {
+        geminiQueue.splice(idx, 1);
+        resolve(false);
+      }
+    }, 3500);
+  });
+}
+
+function releaseGeminiSlot(): void {
+  activeGeminiCalls = Math.max(0, activeGeminiCalls - 1);
+  while (geminiQueue.length > 0) {
+    const next = geminiQueue.shift();
+    if (next) {
+      if (Date.now() - next.queuedAt <= 4000) {
+        activeGeminiCalls++;
+        next.resolve(true);
+        return;
+      }
+    }
+  }
+}
 
 // Initialize Gemini SDK lazily with telemetry
 function getGeminiClient() {
@@ -26,56 +170,71 @@ function getGeminiClient() {
   });
 }
 
-// Resilient Gemini caller with automatic retry and model fallback (gemini-3.8-flash -> gemini-flash-latest -> gemini-3.1-flash-lite)
+// Resilient Gemini caller with automatic retry, queue limiter, and model fallback
 interface GeminiCallParams {
   contents: any;
   config?: any;
 }
 
-const PRIMARY_MODEL = "gemini-3.6-flash";
-const FALLBACK_MODELS = ["gemini-flash-latest", "gemini-3.8-flash"];
+const PRIMARY_MODEL = "gemini-3.8-flash";
+const FALLBACK_MODELS = ["gemini-flash-latest", "gemini-3.1-flash-lite"];
 
 async function callGemini(params: GeminiCallParams) {
-  const ai = getGeminiClient();
-  if (!ai) return null;
-
-  const modelsToTry = [PRIMARY_MODEL, ...FALLBACK_MODELS];
-  let lastError: any = null;
-
-  for (const modelName of modelsToTry) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const response = await ai.models.generateContent({
-          model: modelName,
-          contents: params.contents,
-          config: params.config,
-        });
-        if (response && response.text) {
-          return response;
-        }
-      } catch (err: any) {
-        lastError = err;
-        const errMsg = err?.message || String(err);
-        const isTransient =
-          errMsg.includes("503") ||
-          errMsg.includes("429") ||
-          errMsg.includes("UNAVAILABLE") ||
-          errMsg.includes("high demand") ||
-          errMsg.includes("RESOURCE_EXHAUSTED");
-
-        if (isTransient && attempt === 0) {
-          // Brief pause before retry
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          continue;
-        }
-        // If second attempt or non-transient error, move to fallback model
-        break;
-      }
-    }
+  const hasSlot = await acquireGeminiSlot();
+  if (!hasSlot) {
+    return null;
   }
 
-  console.warn("Gemini service temporarily unavailable across models, using intelligent fallback response:", lastError?.message || lastError);
-  return null;
+  try {
+    const ai = getGeminiClient();
+    if (!ai) return null;
+
+    const modelsToTry = [PRIMARY_MODEL, ...FALLBACK_MODELS];
+    let lastError: any = null;
+
+    for (const modelName of modelsToTry) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const callPromise = ai.models.generateContent({
+            model: modelName,
+            contents: params.contents,
+            config: params.config,
+          });
+
+          // Timeout protection (8.5 seconds max)
+          const timeoutPromise = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("Gemini request timeout 8500ms")), 8500)
+          );
+
+          const response = await Promise.race([callPromise, timeoutPromise]);
+          if (response && response.text) {
+            return response;
+          }
+        } catch (err: any) {
+          lastError = err;
+          const errMsg = err?.message || String(err);
+          const isTransient =
+            errMsg.includes("503") ||
+            errMsg.includes("429") ||
+            errMsg.includes("UNAVAILABLE") ||
+            errMsg.includes("high demand") ||
+            errMsg.includes("RESOURCE_EXHAUSTED") ||
+            errMsg.includes("timeout");
+
+          if (isTransient && attempt === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 400));
+            continue;
+          }
+          break;
+        }
+      }
+    }
+
+    console.warn("Gemini unavailable across models, using intelligent fallback response:", lastError?.message || lastError);
+    return null;
+  } finally {
+    releaseGeminiSlot();
+  }
 }
 
 function parseJsonSafely<T>(text: string | undefined | null, fallback: T): T {
@@ -93,17 +252,22 @@ function parseJsonSafely<T>(text: string | undefined | null, fallback: T): T {
   }
 }
 
-// Health check endpoint
+// Health check endpoint with system metrics
 app.get("/api/health", (_req: Request, res: Response) => {
   res.json({
     status: "ok",
     hasApiKey: !!process.env.GEMINI_API_KEY,
     universe: "READVERSE",
+    activeGeminiCalls,
+    queueLength: geminiQueue.length,
+    cacheEntries: serverCache.size,
+    memoryUsageMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+    uptimeSeconds: Math.round(process.uptime()),
   });
 });
 
 // 1. AI Cosmic Companion ("Komi" / "Sao Nhỏ") Chat
-app.post("/api/companion/chat", async (req: Request, res: Response) => {
+app.post("/api/companion/chat", aiRateLimiter, async (req: Request, res: Response) => {
   try {
     const {
       message,
@@ -117,6 +281,10 @@ app.post("/api/companion/chat", async (req: Request, res: Response) => {
     } = req.body;
 
     const fallbackReply = `Chào phi hành gia ${astronautName || "bạn nhỏ"}! Sao Nhỏ Komi luôn đồng hành cùng bạn trên ${currentPlanet || "chuyến hành trình này"}. Bạn nghĩ điều gì làm nên sức sống lâu bền của tác phẩm này? 🌟`;
+
+    if ((req as any)._forceFallback) {
+      return res.json({ reply: fallbackReply });
+    }
 
     const systemInstruction = `Bạn là Komi - người bạn đồng hành vũ trụ thông minh, ấm áp và hóm hỉnh của READVERSE (vũ trụ đọc sách và tư duy phản biện dành cho học sinh THPT).
 Tông giọng: Thân thiện, tò mò, khuyến khích suy nghĩ sâu, tuyệt đối không nói giọng trẻ con mẫu giáo, không đưa ra câu trả lời sẵn ngay lập tức mà gợi mở bằng câu hỏi kích thích tư duy (Socratic questioning).
@@ -158,11 +326,17 @@ Nhiệm vụ: Trả lời ngắn gọn (dưới 120 từ), ấm áp, đưa ra 1 
 });
 
 // Endpoint: Generate dynamic Detective Case based on student's declared read work
-app.post("/api/investigate/generate-case", async (req: Request, res: Response) => {
+app.post("/api/investigate/generate-case", aiRateLimiter, async (req: Request, res: Response) => {
   try {
     const { workTitle, author } = req.body;
     if (!workTitle) {
       return res.status(400).json({ error: "Tên tác phẩm là bắt buộc" });
+    }
+
+    const cacheKey = `case:${(workTitle || "").toLowerCase().trim()}`;
+    const cached = getCachedResult<any>(cacheKey);
+    if (cached) {
+      return res.json(cached);
     }
 
     const fallbackCase = {
@@ -182,6 +356,10 @@ app.post("/api/investigate/generate-case", async (req: Request, res: Response) =
         `Hình ảnh biểu tượng hoặc không gian nghệ thuật gắn liền với bước ngoặt.`,
       ],
     };
+
+    if ((req as any)._forceFallback) {
+      return res.json(fallbackCase);
+    }
 
     const prompt = `Bạn là Trưởng ban Thám Tử Văn Học tại READVERSE.
 Học sinh đã khai báo ĐÃ ĐỌC tác phẩm: "${workTitle}" (Tác giả: "${author || "chưa rõ"}").
@@ -210,7 +388,7 @@ Trả về JSON thuần túy:
 
     if (response?.text) {
       const parsed = parseJsonSafely(response.text, fallbackCase);
-      return res.json({
+      const generated = {
         id: "gen-case-" + Date.now(),
         workTitle,
         author: author || "Khuyết danh",
@@ -218,7 +396,9 @@ Trả về JSON thuần túy:
         context: parsed.context || fallbackCase.context,
         guidingClues: Array.isArray(parsed.guidingClues) ? parsed.guidingClues : fallbackCase.guidingClues,
         suggestedEvidences: Array.isArray(parsed.suggestedEvidences) ? parsed.suggestedEvidences : fallbackCase.suggestedEvidences,
-      });
+      };
+      setCachedResult(cacheKey, generated, 3600);
+      return res.json(generated);
     }
 
     return res.json(fallbackCase);
@@ -243,7 +423,7 @@ Trả về JSON thuần túy:
 });
 
 // 2. Planet 02 — Detective / Thám Tử: Evaluate Evidence & Reasoning
-app.post("/api/investigate/evaluate", async (req: Request, res: Response) => {
+app.post("/api/investigate/evaluate", aiRateLimiter, async (req: Request, res: Response) => {
   try {
     const { claim, evidence, reasoning, workTitle } = req.body;
 
@@ -254,6 +434,10 @@ app.post("/api/investigate/evaluate", async (req: Request, res: Response) => {
       missingPerspectives: "Bạn có thể cân nhắc xem liệu hoàn cảnh xã hội có ép buộc nhân vật hay không?",
       badgeEarned: "Kính Lúp Tinh Tường",
     };
+
+    if ((req as any)._forceFallback) {
+      return res.json(fallback);
+    }
 
     const prompt = `Bạn là Giám Khảo Thám Tử Văn Học của Hành Tinh Thám Tử trong READVERSE.
 Đề bài luận điểm cần thẩm tra: "${claim}"
@@ -297,11 +481,17 @@ Hãy đánh giá và phản hồi bằng định dạng JSON thuần túy gồm 
 });
 
 // Dynamic endpoint: Generate Debate Topic based on student's declared read work
-app.post("/api/debate/generate-topic", async (req: Request, res: Response) => {
+app.post("/api/debate/generate-topic", aiRateLimiter, async (req: Request, res: Response) => {
   try {
     const { workTitle, author } = req.body;
     if (!workTitle) {
       return res.status(400).json({ error: "Tên tác phẩm là bắt buộc" });
+    }
+
+    const cacheKey = `debate:${(workTitle || "").toLowerCase().trim()}`;
+    const cached = getCachedResult<any>(cacheKey);
+    if (cached) {
+      return res.json(cached);
     }
 
     const fallbackTopic = {
@@ -313,6 +503,10 @@ app.post("/api/debate/generate-topic", async (req: Request, res: Response) => {
       workRef: workTitle,
       contextPrompt: `Cuộc tranh luận xoay quanh giá trị nhân văn và tính tất yếu của số phận trong "${workTitle}".`,
     };
+
+    if ((req as any)._forceFallback) {
+      return res.json(fallbackTopic);
+    }
 
     const prompt = `Bạn là Trọng Tài Trí Tuệ tại Đấu Trường Tranh Biện của READVERSE.
 Học sinh ĐÃ ĐỌC tác phẩm: "${workTitle}" (Tác giả: "${author || "Khuyết danh"}").
@@ -342,7 +536,7 @@ Trả về JSON thuần túy:
 
     if (response?.text) {
       const parsed = parseJsonSafely(response.text, fallbackTopic);
-      return res.json({
+      const generated = {
         id: "gen-deb-" + Date.now(),
         title: parsed.title || fallbackTopic.title,
         dilemma: parsed.dilemma || fallbackTopic.dilemma,
@@ -350,7 +544,9 @@ Trả về JSON thuần túy:
         stanceB: parsed.stanceB || fallbackTopic.stanceB,
         workRef: workTitle,
         contextPrompt: parsed.contextPrompt || fallbackTopic.contextPrompt,
-      });
+      };
+      setCachedResult(cacheKey, generated, 3600);
+      return res.json(generated);
     }
 
     return res.json(fallbackTopic);
@@ -369,7 +565,7 @@ Trả về JSON thuần túy:
 });
 
 // 3. Planet 03 — Debate / Đấu Trí: Opposing Argument & Round Evaluation
-app.post("/api/debate/turn", async (req: Request, res: Response) => {
+app.post("/api/debate/turn", aiRateLimiter, async (req: Request, res: Response) => {
   try {
     const { topic, round, playerPosition, playerInput, history } = req.body;
 
@@ -378,6 +574,10 @@ app.post("/api/debate/turn", async (req: Request, res: Response) => {
       coachingTip: "Dùng chi tiết hành động nhỏ hoặc diễn biến nội tâm để củng cố luận điểm.",
       scores: { logic: 88, evidence: 84, empathy: 90 },
     };
+
+    if ((req as any)._forceFallback) {
+      return res.json(fallback);
+    }
 
     const prompt = `Bạn là Trọng Tài Trí Tuệ tại Hành Tinh Đấu Trí của READVERSE.
 Chủ đề tranh biện văn học: "${topic}"
@@ -422,7 +622,7 @@ Hãy đưa ra phản biện hoặc đánh giá vòng đấu dưới định dạ
 });
 
 // Debate synthesis/conclusion endpoint (no simple win/lose, evaluates multi-perspective thinking)
-app.post("/api/debate/conclude", async (req: Request, res: Response) => {
+app.post("/api/debate/conclude", aiRateLimiter, async (req: Request, res: Response) => {
   try {
     const { topic, playerPosition, history, roundsCount } = req.body;
 
@@ -435,6 +635,10 @@ app.post("/api/debate/conclude", async (req: Request, res: Response) => {
       strengths: "Lập luận mạch lạc, biết cách dẫn chứng và tôn trọng tính phức tạp của nhân vật văn học.",
       growthAreas: "Có thể tiếp tục đào sâu bối cảnh lịch sử để củng cố tính thời đại của quan điểm.",
     };
+
+    if ((req as any)._forceFallback) {
+      return res.json(fallback);
+    }
 
     const prompt = `Bạn là Trọng Tài Trí Tuệ tại Hành Tinh Đấu Trí của READVERSE.
 Chủ đề tranh biện: "${topic}"
@@ -484,7 +688,7 @@ Trả về JSON thuần túy:
 });
 
 // 4. Planet 04 — Connect / Liên Kết: Evaluate Constellation Pathways
-app.post("/api/connect/evaluate", async (req: Request, res: Response) => {
+app.post("/api/connect/evaluate", aiRateLimiter, async (req: Request, res: Response) => {
   try {
     const { nodes, connectionReason, insight } = req.body;
     const reason = connectionReason || insight || "Sự đồng điệu giữa số phận cá nhân và bức tranh thời đại";
@@ -497,6 +701,10 @@ app.post("/api/connect/evaluate", async (req: Request, res: Response) => {
       feedback: "Liên kết tuyệt vời! Bạn đã nối liền số phận cá nhân trong văn học với những trăn trở muôn thuở của kiếp nhân sinh.",
       unlockedStar: "Sao Thiên Cơ",
     };
+
+    if ((req as any)._forceFallback) {
+      return res.json(fallback);
+    }
 
     const prompt = `Bạn là Thợ Kiến Tạo Chòm Sao Tri Thức tại Hành Tinh Liên Kết của READVERSE.
 Học sinh vừa tạo đường nối giữa các nút: ${JSON.stringify(nodes)}
@@ -548,11 +756,17 @@ Hãy đánh giá sợi dây liên tưởng này và trả lời dạng JSON thu�
 });
 
 // Dynamic endpoint: Generate Creative Prompt based on student's declared read work
-app.post("/api/create/generate-prompt", async (req: Request, res: Response) => {
+app.post("/api/create/generate-prompt", aiRateLimiter, async (req: Request, res: Response) => {
   try {
     const { workTitle, author } = req.body;
     if (!workTitle) {
       return res.status(400).json({ error: "Tên tác phẩm là bắt buộc" });
+    }
+
+    const cacheKey = `prompt:${(workTitle || "").toLowerCase().trim()}`;
+    const cached = getCachedResult<any>(cacheKey);
+    if (cached) {
+      return res.json(cached);
     }
 
     const fallbackPrompt = {
@@ -564,6 +778,10 @@ app.post("/api/create/generate-prompt", async (req: Request, res: Response) => {
       characterFocus: "Tâm lý và diễn biến nội tâm của nhân vật chính",
       starterQuestion: "Chi tiết đầu tiên thay đổi sẽ kéo theo chuỗi biến chuyển nào tiếp theo?",
     };
+
+    if ((req as any)._forceFallback) {
+      return res.json(fallbackPrompt);
+    }
 
     const prompt = `Bạn là Giám Tuyển Sáng Tạo tại Xưởng Kiến Tạo Văn Học của READVERSE.
 Học sinh ĐÃ ĐỌC tác phẩm: "${workTitle}" (Tác giả: "${author || "Khuyết danh"}").
@@ -592,7 +810,7 @@ Trả về JSON thuần túy:
 
     if (response?.text) {
       const parsed = parseJsonSafely(response.text, fallbackPrompt);
-      return res.json({
+      const generated = {
         id: "gen-crt-" + Date.now(),
         title: parsed.title || fallbackPrompt.title,
         originalWork: workTitle,
@@ -600,7 +818,9 @@ Trả về JSON thuần túy:
         scenario: parsed.scenario || fallbackPrompt.scenario,
         characterFocus: parsed.characterFocus || fallbackPrompt.characterFocus,
         starterQuestion: parsed.starterQuestion || fallbackPrompt.starterQuestion,
-      });
+      };
+      setCachedResult(cacheKey, generated, 3600);
+      return res.json(generated);
     }
 
     return res.json(fallbackPrompt);
@@ -619,7 +839,7 @@ Trả về JSON thuần túy:
 });
 
 // 5. Planet 05 — Create / Kiến Tạo: Creative Alternative Scenarios
-app.post("/api/create/evaluate", async (req: Request, res: Response) => {
+app.post("/api/create/evaluate", aiRateLimiter, async (req: Request, res: Response) => {
   try {
     const { originalWork, promptScenario, promptTitle, playerStory, studentText } = req.body;
     const scenario = promptTitle || promptScenario || "Khám phá góc nhìn ngoại truyện";
@@ -636,6 +856,10 @@ app.post("/api/create/evaluate", async (req: Request, res: Response) => {
       badge: "Bản Phác Thảo Ngân Hà",
       artifactTitle: "Bản Phác Thảo Ngân Hà",
     };
+
+    if ((req as any)._forceFallback) {
+      return res.json(fallback);
+    }
 
     const prompt = `Bạn là Giám Tuyển Sáng Tạo tại Hành Tinh Kiến Tạo của READVERSE.
 Tác phẩm gốc: "${originalWork}"
@@ -690,7 +914,7 @@ Hãy đánh giá tác phẩm sáng tạo dưới định dạng JSON thuần tú
 });
 
 // Co-creation AI feedback endpoint (does not write for them, gives suggestions on voice, emotion, imagery)
-app.post("/api/create/co-create-feedback", async (req: Request, res: Response) => {
+app.post("/api/create/co-create-feedback", aiRateLimiter, async (req: Request, res: Response) => {
   try {
     const { originalWork, promptTitle, studentDraft } = req.body;
 
@@ -703,6 +927,10 @@ app.post("/api/create/co-create-feedback", async (req: Request, res: Response) =
       ],
       encouragement: "Đoạn văn của bạn đã có hồn cốt rất tốt! Hãy tiếp tục mở rộng thêm.",
     };
+
+    if ((req as any)._forceFallback) {
+      return res.json(fallback);
+    }
 
     const prompt = `Bạn là Trợ Lý Đồng Sáng Tạo Văn Học của READVERSE.
 Học sinh đang viết đoạn văn sáng tạo về tác phẩm "${originalWork || "Văn học"}" (Đề bài: "${promptTitle || "Sáng tạo ngoại truyện"}").
@@ -756,7 +984,7 @@ Trả về JSON thuần túy:
 // ============================================================================
 // HÀNH TRÌNH SÁNG TẠO: AI STORY PARTNER (Section IV & V)
 // ============================================================================
-app.post("/api/create/story-partner", async (req: Request, res: Response) => {
+app.post("/api/create/story-partner", aiRateLimiter, async (req: Request, res: Response) => {
   try {
     const {
       originalWork,
@@ -796,6 +1024,10 @@ app.post("/api/create/story-partner", async (req: Request, res: Response) => {
         `Ai trong tác phẩm sẽ là người đầu tiên nhận ra sự thay đổi này và phản ứng ra sao?`,
       ],
     };
+
+    if ((req as any)._forceFallback) {
+      return res.json(fallbackResponse);
+    }
 
     const prompt = `Bạn là "AI Story Partner" (Cộng sự sáng tạo văn học) tại READVERSE.
 Bạn đang đồng hành cùng học sinh THPT phát triển một hướng đi mới cho tác phẩm văn học.
@@ -895,7 +1127,7 @@ NGUYÊN TẮC TỐI CAO:
 // ============================================================================
 // AI KIỂM TRA TRƯỚC KHI CÔNG KHAI (Section XVI)
 // ============================================================================
-app.post("/api/create/safety-check", async (req: Request, res: Response) => {
+app.post("/api/create/safety-check", aiRateLimiter, async (req: Request, res: Response) => {
   try {
     const { title, creativeContent, originalWork } = req.body;
     const textToCheck = `${title || ""} ${creativeContent || ""}`.trim();
@@ -904,10 +1136,20 @@ app.post("/api/create/safety-check", async (req: Request, res: Response) => {
       return res.json({ isSafe: true });
     }
 
+    const cacheKey = `safety:${originalWork || ""}:${textToCheck.slice(0, 100)}_${textToCheck.length}`;
+    const cached = getCachedResult<any>(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
     const fallback = {
       isSafe: true,
       warning: "",
     };
+
+    if ((req as any)._forceFallback) {
+      return res.json(fallback);
+    }
 
     const prompt = `Bạn là Trợ lý Kiểm định An toàn Sáng tạo cho học sinh THPT trên nền tảng giáo dục văn học READVERSE.
 Kiểm tra bản sáng tạo văn học sau đây:
@@ -937,10 +1179,12 @@ Trả về JSON thuần túy:
 
     if (response?.text) {
       const data = parseJsonSafely(response.text, fallback);
-      return res.json({
+      const result = {
         isSafe: data.isSafe ?? true,
         warning: data.warning || "",
-      });
+      };
+      setCachedResult(cacheKey, result, 1800);
+      return res.json(result);
     }
 
     return res.json(fallback);
@@ -953,52 +1197,151 @@ Trả về JSON thuần túy:
 // ============================================================================
 // GỢI Ý MỞ ĐẦU BÌNH LUẬN GÓC NHÌN (Section XII)
 // ============================================================================
-app.post("/api/create/comment-starters", async (req: Request, res: Response) => {
-  try {
-    const { perspectiveTitle, originalWork, introduction } = req.body;
-
-    const fallback = {
-      starters: [
-        { type: "impression", label: "Điều mình ấn tượng", text: `Mình đặc biệt ấn tượng với cách bạn giải quyết nút thắt của "${originalWork || "tác phẩm"}", bởi vì...` },
-        { type: "unthought", label: "Điều mình chưa từng nghĩ tới", text: "Trước đây mình chưa từng nghĩ câu chuyện có thể rẽ sang hướng này, chi tiết khiến mình bất ngờ nhất là..." },
-        { type: "agree", label: "Điểm mình đồng tình", text: "Mình rất đồng tình với cách bạn khắc họa phẩm chất lương thiện của nhân vật khi..." },
-        { type: "explore_more", label: "Điểm muốn khám phá thêm", text: "Nếu câu chuyện tiếp tục sau cái kết này, mình rất tò mò liệu nhân vật sẽ..." },
-      ],
-    };
-
-    return res.json(fallback);
-  } catch (error) {
-    res.json({
-      starters: [
-        { type: "impression", label: "Điều mình ấn tượng", text: "Điều mình ấn tượng nhất ở góc nhìn này là..." },
-        { type: "unthought", label: "Điều mình chưa từng nghĩ tới", text: "Mình chưa từng nghĩ đến hướng phát triển này vì..." },
-        { type: "agree", label: "Điểm mình đồng tình", text: "Mình đồng cảm với nhân vật ở chỗ..." },
-        { type: "explore_more", label: "Điểm muốn khám phá thêm", text: "Mình tò mò không biết diễn biến tiếp theo sẽ ra sao nếu..." },
-      ],
-    });
-  }
+app.post("/api/create/comment-starters", (req: Request, res: Response) => {
+  const { originalWork } = req.body;
+  const work = originalWork || "tác phẩm";
+  res.json({
+    starters: [
+      { type: "impression", label: "Điều mình ấn tượng", text: `Mình đặc biệt ấn tượng với cách bạn gỡ nút thắt trong "${work}", bởi vì...` },
+      { type: "unthought", label: "Điều mình chưa từng nghĩ tới", text: "Trước đây mình chưa từng nghĩ câu chuyện có thể rẽ sang hướng này, chi tiết bất ngờ nhất là..." },
+      { type: "agree", label: "Điểm mình đồng tình", text: "Mình rất đồng tình với cách bạn trân trọng phẩm giá nhân vật khi..." },
+      { type: "explore_more", label: "Điểm muốn khám phá thêm", text: "Nếu câu chuyện tiếp tục sau bước ngoặt này, mình rất tò mò liệu nhân vật sẽ..." },
+    ],
+  });
 });
 
 // ============================================================================
 // HÀNH TINH TRÍCH DẪN & KHO LƯU TRỮ GÓC NHÌN (PERSPECTIVE STORAGE API)
 // ============================================================================
-// In-memory persistent store during server lifetime
-const publicPerspectivesStore: any[] = [];
+// File-backed persistent store with rich canonical perspectives
+const MAX_PERSPECTIVES_STORE = 160;
+const PERSPECTIVES_FILE_PATH = path.join(process.cwd(), "perspectives_store.json");
 
-// GET all public perspectives
+const SEED_PERSPECTIVES: any[] = [
+  {
+    id: "persp-seed-vo-nhat-1",
+    authorId: "seed-author-1",
+    displayName: "Minh Khuê (Sao Sáng)",
+    originalWorkId: "work-vo-nhat",
+    originalWorkTitle: "Vợ Nhặt",
+    originalWorkAuthor: "Kim Lân",
+    characters: ["Tràng", "Thị (vợ Tràng)", "Bà cụ Tứ"],
+    context: "Nạn đói năm Ất Dậu 1945 tại xóm ngụ cư nghèo đói.",
+    turningPoint: "Tràng quyết định mang một nửa bát cháo cám chia cho đứa trẻ đói lả trước cổng xóm",
+    originalSituationSummary: "Sáng hôm sau ngày cưới, bà cụ Tứ bưng nồi cháo cám đắng chát ra, cả nhà vừa ăn vừa ngậm ngùi nghe tiếng trống thúc thuế dồn dập.",
+    title: "Ngọn lửa chia sẻ giữa nạn đói xóm ngụ cư",
+    introduction: "Một góc nhìn khác về bữa ăn sáng sau ngày cưới của Tràng: khi sự sẻ chia vượt qua cả nỗi sợ đói khát.",
+    creativeContent: `[LỰA CHỌN CỦA BẠN]\nTràng dừng đũa trước nồi cháo cám. Nghe tiếng khóc thút thít của đứa bé con nhà hàng xóm bên ngoài hàng rào, anh không nỡ nuốt một mình. Tràng xin phép mẹ chia nửa bát cháo cám ấm nóng đưa qua khe liếp cho đứa nhỏ.\n\n[DIỄN BIẾN MỚI]\nBà cụ Tứ nhìn con, đôi mắt già nua đỏ hoe nhưng ánh lên niềm tự hào. Người vợ nhặt cũng im lặng rồi gật đầu, đưa thêm mẩu vỏ bí luộc còn sót lại. Hành động nhỏ ấy không xua đi được nạn đói, nhưng thắp lên một đốm sáng tình người ấm áp lan tỏa khắp xóm ngụ cư.\n\n[KẾT CỤC TÁI THIẾT]\nKhi đoàn người đói kéo lên phá kho thóc của Nhật, dân xóm ngụ cư đã nắm chặt tay nhau thành một khối. Tràng và vợ cùng bước đi giữa lá cờ đỏ sao vàng, trong lòng không còn nỗi sợ hãi đơn độc.`,
+    storyBranches: [
+      { id: "s-1", stepType: "original_plot", stepTitle: "TÌNH HUỐNG NGUYÊN TÁC", content: "Bữa cơm đón dâu nghèo khó chỉ có nồi cháo cám đắng chát và tiếng trống thúc thuế ngoài đình.", timestamp: "Gốc" },
+      { id: "s-2", stepType: "turning_point", stepTitle: "ĐIỂM RẼ ĐÃ CHỌN", content: "Tràng quyết định chia nửa phần ăn cho đứa trẻ đói bên hàng xóm thay vì cam chịu ăn hết trong câm lặng.", timestamp: "Bước ngoặt" },
+      { id: "s-3", stepType: "new_development", stepTitle: "DIỄN BIẾN MỚI", content: "Sự đồng lòng của người vợ và bà cụ Tứ tạo nên một sợi dây gắn kết gia đình bền chặt giữa nghịch cảnh.", timestamp: "Phát triển" },
+      { id: "s-4", stepType: "climax_ending", stepTitle: "KẾT CỤC TÁI THIẾT", content: "Họ cùng dân làng vùng lên giành lấy sự sống dưới ánh sáng cách mạng.", timestamp: "Đoạn kết" },
+    ],
+    themes: ["Tình người", "Lòng trắc ẩn", "Vượt lên nghịch cảnh"],
+    visibility: "public",
+    createdAt: "2026-03-20T10:00:00.000Z",
+    updatedAt: "2026-03-20T10:00:00.000Z",
+    empathyCount: 14,
+    empathyUsers: ["user-1", "user-2"],
+    bookmarkedBy: [],
+    comments: [
+      { id: "c-1", userName: "Hoàng Nam", text: "Góc nhìn rất nhân văn! Kim Lân hẳn cũng sẽ mỉm cười khi thấy tinh thần đùm bọc được đẩy lên cao độ thế này.", timestamp: "Hôm qua", starterType: "agree" },
+    ],
+  },
+  {
+    id: "persp-seed-lao-hac-1",
+    authorId: "seed-author-2",
+    displayName: "Tuấn Kiệt (Thám Hiểm)",
+    originalWorkId: "work-lao-hac",
+    originalWorkTitle: "Lão Hạc",
+    originalWorkAuthor: "Nam Cao",
+    characters: ["Lão Hạc", "Ông giáo", "Cậu Vàng"],
+    context: "Làng quê nghèo trước Cách mạng, người nông dân bị bần cùng hóa cùng cực.",
+    turningPoint: "Lão Hạc không chọn bả chó tự vẫn mà quyết định trao lại mảnh vườn cho ông giáo để đi tìm con trai",
+    originalSituationSummary: "Lão Hạc bán cậu Vàng trong đau đớn, gửi gắm tiền và mảnh vườn cho ông giáo rồi xin bả chó của Binh Tư để tự kết liễu cuộc đời trong co giật dữ dội.",
+    title: "Hành trình đi tìm đứa con phương xa của Lão Hạc",
+    introduction: "Nếu tình thương con không biến thành sự hy sinh tiêu cực, Lão Hạc sẽ chọn một lối thoát đầy nghị lực hơn.",
+    creativeContent: `[LỰA CHỌN CỦA BẠN]\nLão Hạc không xin bả chó. Lão cầm bọc tiền dành dụm, đến nhà ông giáo dập đầu tạ ơn và nhờ giữ hộ giấy tờ mảnh vườn. Nhưng thay vì ở lại chờ chết mòn, lão khoác tay nải quyết định lên đồn điền cao su tìm con trai.\n\n[DIỄN BIẾN MỚI]\nÔng giáo khóc, khuyên lão tuổi già sức yếu đường xa vạn dặm. Nhưng ánh mắt lão kiên nghị: 'Tôi sống mòn ở đây thì chết mất xác vì đói, thà đi tìm nó, sống hay chết bố con cũng được nhìn mặt nhau một lần.'\n\n[KẾT CỤC TÁI THIẾT]\nCuộc hành trình gian nan kéo dài nhiều tháng trời. Dù trải qua muôn vàn đói rét dọc đường, ngọn lửa tình phụ tử đã nâng bước chân lão. Hai cha con cuối cùng cũng tìm thấy nhau giữa rừng cao su bạt ngàn, cùng thề sẽ sống để ngày trở về quê cha đất tổ.`,
+    storyBranches: [
+      { id: "l-1", stepType: "original_plot", stepTitle: "TÌNH HUỐNG NGUYÊN TÁC", content: "Lão Hạc tuyệt vọng sau khi bán chó và quyết định tự vẫn bằng bả chó.", timestamp: "Gốc" },
+      { id: "l-2", stepType: "turning_point", stepTitle: "ĐIỂM RẼ ĐÃ CHỌN", content: "Lão chuyển hướng nỗi đau thành động lực đi tìm con thay vì cam chịu cái chết bi thảm.", timestamp: "Bước ngoặt" },
+      { id: "l-3", stepType: "climax_ending", stepTitle: "KẾT CỤC TÁI THIẾT", content: "Cuộc hội ngộ cảm động thắp lên hy vọng cho thế hệ trẻ.", timestamp: "Đoạn kết" },
+    ],
+    themes: ["Tình cha con", "Nghị lực sống", "Hy vọng"],
+    visibility: "public",
+    createdAt: "2026-03-21T08:30:00.000Z",
+    updatedAt: "2026-03-21T08:30:00.000Z",
+    empathyCount: 19,
+    empathyUsers: ["user-3", "user-4"],
+    bookmarkedBy: [],
+    comments: [
+      { id: "c-2", userName: "Ngọc Mai", text: "Đoạn kết này làm mình rớt nước mắt vì nhẹ nhõm. Lão Hạc xứng đáng được sống để nhìn thấy con trở về!", timestamp: "Hôm nay", starterType: "impression" },
+    ],
+  },
+];
+
+const publicPerspectivesStore: any[] = [...SEED_PERSPECTIVES];
+
+let isSavingPerspectives = false;
+let pendingSavePerspectives = false;
+
+async function savePerspectivesToFile() {
+  if (isSavingPerspectives) {
+    pendingSavePerspectives = true;
+    return;
+  }
+  isSavingPerspectives = true;
+  try {
+    await fs.promises.writeFile(
+      PERSPECTIVES_FILE_PATH,
+      JSON.stringify(publicPerspectivesStore, null, 2),
+      "utf-8"
+    );
+  } catch (err) {
+    console.error("Failed to persist perspectives to file:", err);
+  } finally {
+    isSavingPerspectives = false;
+    if (pendingSavePerspectives) {
+      pendingSavePerspectives = false;
+      savePerspectivesToFile();
+    }
+  }
+}
+
+function loadPersistedPerspectives() {
+  try {
+    if (fs.existsSync(PERSPECTIVES_FILE_PATH)) {
+      const data = fs.readFileSync(PERSPECTIVES_FILE_PATH, "utf-8");
+      const parsed = JSON.parse(data);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        publicPerspectivesStore.length = 0;
+        publicPerspectivesStore.push(...parsed.slice(0, MAX_PERSPECTIVES_STORE));
+        return;
+      }
+    }
+  } catch (err) {
+    console.warn("Could not load persisted perspectives, using seed defaults:", err);
+  }
+  savePerspectivesToFile();
+}
+
+loadPersistedPerspectives();
+
+// GET all public perspectives (with optional filter)
 app.get("/api/creative-perspectives", (req: Request, res: Response) => {
   const { workTitle } = req.query;
   let list = publicPerspectivesStore.filter((p) => p.visibility === "public");
-  if (workTitle && typeof workTitle === "string") {
+  if (workTitle && typeof workTitle === "string" && workTitle !== "Tất cả") {
     const target = workTitle.toLowerCase().trim();
     list = list.filter((p) => (p.originalWorkTitle || "").toLowerCase().includes(target));
   }
   // Sort newest first
   list.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
-  res.json(list);
+  res.json(list.slice(0, 100)); // Limit to 100 per response to prevent giant payloads
 });
 
-// POST save / publish perspective
+// POST save / publish perspective (with safety bounding and sanitization)
 app.post("/api/creative-perspectives", (req: Request, res: Response) => {
   try {
     const item = req.body;
@@ -1006,32 +1349,48 @@ app.post("/api/creative-perspectives", (req: Request, res: Response) => {
       return res.status(400).json({ error: "Thiếu thông tin tiêu đề hoặc tác phẩm gốc" });
     }
 
-    const id = item.id || `persp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const id = String(item.id || `persp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
     const now = new Date().toISOString();
 
     const record = {
       id,
-      authorId: item.authorId || "anonymous",
-      displayName: item.displayName || "Nhà Thám Hiểm Vũ Trụ",
-      originalWorkId: item.originalWorkId || "",
-      originalWorkTitle: item.originalWorkTitle,
-      originalWorkAuthor: item.originalWorkAuthor || "Khuyết danh",
-      characters: item.characters || [],
-      context: item.context || "",
-      turningPoint: item.turningPoint || "",
-      originalSituationSummary: item.originalSituationSummary || "",
-      title: item.title,
-      introduction: item.introduction || "",
-      creativeContent: item.creativeContent || "",
-      storyBranches: Array.isArray(item.storyBranches) ? item.storyBranches : [],
-      themes: Array.isArray(item.themes) ? item.themes : [],
+      authorId: String(item.authorId || "anonymous").slice(0, 60),
+      displayName: String(item.displayName || "Nhà Thám Hiểm Vũ Trụ").slice(0, 60),
+      originalWorkId: String(item.originalWorkId || "").slice(0, 60),
+      originalWorkTitle: String(item.originalWorkTitle).slice(0, 150),
+      originalWorkAuthor: String(item.originalWorkAuthor || "Khuyết danh").slice(0, 100),
+      characters: Array.isArray(item.characters) ? item.characters.map((c: any) => String(c).slice(0, 60)).slice(0, 10) : [],
+      context: String(item.context || "").slice(0, 600),
+      turningPoint: String(item.turningPoint || "").slice(0, 600),
+      originalSituationSummary: String(item.originalSituationSummary || "").slice(0, 1000),
+      title: String(item.title).slice(0, 180),
+      introduction: String(item.introduction || "").slice(0, 1000),
+      creativeContent: String(item.creativeContent || "").slice(0, 15000),
+      storyBranches: Array.isArray(item.storyBranches)
+        ? item.storyBranches.slice(0, 20).map((b: any) => ({
+            id: String(b.id || "").slice(0, 40),
+            stepType: b.stepType || "user_choice",
+            stepTitle: String(b.stepTitle || "").slice(0, 60),
+            content: String(b.content || "").slice(0, 2000),
+            timestamp: String(b.timestamp || "").slice(0, 40),
+          }))
+        : [],
+      themes: Array.isArray(item.themes) ? item.themes.map((t: any) => String(t).slice(0, 40)).slice(0, 8) : [],
       visibility: item.visibility === "public" ? "public" : "private",
       createdAt: item.createdAt || now,
       updatedAt: now,
-      empathyCount: item.empathyCount || 0,
-      empathyUsers: Array.isArray(item.empathyUsers) ? item.empathyUsers : [],
-      bookmarkedBy: Array.isArray(item.bookmarkedBy) ? item.bookmarkedBy : [],
-      comments: Array.isArray(item.comments) ? item.comments : [],
+      empathyCount: Math.max(0, Number(item.empathyCount) || 0),
+      empathyUsers: Array.isArray(item.empathyUsers) ? item.empathyUsers.map(String).slice(0, 500) : [],
+      bookmarkedBy: Array.isArray(item.bookmarkedBy) ? item.bookmarkedBy.map(String).slice(0, 500) : [],
+      comments: Array.isArray(item.comments)
+        ? item.comments.slice(0, 60).map((c: any) => ({
+            id: String(c.id || "").slice(0, 40),
+            userName: String(c.userName || "Bạn đọc").slice(0, 60),
+            text: String(c.text || "").slice(0, 600),
+            timestamp: String(c.timestamp || "").slice(0, 60),
+            starterType: c.starterType || "custom",
+          }))
+        : [],
       aiPartnerAdvice: item.aiPartnerAdvice || null,
     };
 
@@ -1040,8 +1399,12 @@ app.post("/api/creative-perspectives", (req: Request, res: Response) => {
       publicPerspectivesStore[existingIdx] = record;
     } else {
       publicPerspectivesStore.unshift(record);
+      if (publicPerspectivesStore.length > MAX_PERSPECTIVES_STORE) {
+        publicPerspectivesStore.splice(MAX_PERSPECTIVES_STORE);
+      }
     }
 
+    savePerspectivesToFile();
     res.json(record);
   } catch (error) {
     console.error("Save perspective error:", error);
@@ -1060,26 +1423,30 @@ app.post("/api/creative-perspectives/:id/interact", (req: Request, res: Response
   }
 
   if (action === "empathy") {
-    // Toggle "Mình cũng từng nghĩ vậy"
     item.empathyUsers = item.empathyUsers || [];
-    const idx = item.empathyUsers.indexOf(userId || "guest");
+    const safeUserId = String(userId || "guest").slice(0, 60);
+    const idx = item.empathyUsers.indexOf(safeUserId);
     if (idx >= 0) {
       item.empathyUsers.splice(idx, 1);
       item.empathyCount = Math.max(0, (item.empathyCount || 1) - 1);
     } else {
-      item.empathyUsers.push(userId || "guest");
+      item.empathyUsers.push(safeUserId);
       item.empathyCount = (item.empathyCount || 0) + 1;
     }
+    savePerspectivesToFile();
   } else if (action === "comment") {
-    if (commentText && commentText.trim()) {
+    if (commentText && typeof commentText === "string" && commentText.trim()) {
       item.comments = item.comments || [];
-      item.comments.push({
-        id: `cmt-${Date.now()}`,
-        userName: userName || "Bạn đọc",
-        text: commentText.trim(),
-        timestamp: new Date().toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" }) + " hôm nay",
-        starterType: starterType || "custom",
-      });
+      if (item.comments.length < 60) {
+        item.comments.push({
+          id: `cmt-${Date.now()}`,
+          userName: String(userName || "Bạn đọc").slice(0, 50),
+          text: String(commentText).trim().slice(0, 600),
+          timestamp: new Date().toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" }) + " hôm nay",
+          starterType: starterType || "custom",
+        });
+        savePerspectivesToFile();
+      }
     }
   }
 
@@ -1098,6 +1465,7 @@ app.delete("/api/creative-perspectives/:id", (req: Request, res: Response) => {
       return res.status(403).json({ error: "Không có quyền xóa bài viết này" });
     }
     publicPerspectivesStore.splice(idx, 1);
+    savePerspectivesToFile();
     return res.json({ success: true, deletedId: id });
   }
 
@@ -1118,6 +1486,7 @@ app.patch("/api/creative-perspectives/:id/visibility", (req: Request, res: Respo
   }
 
   item.visibility = visibility === "public" ? "public" : "private";
+  savePerspectivesToFile();
   res.json(item);
 });
 
@@ -1172,13 +1541,19 @@ Trả về JSON thuần túy:
 });
 
 // 6. Weekly Recommendations: 3 Personalized Reading Journeys
-app.post("/api/recommendations", async (req: Request, res: Response) => {
+app.post("/api/recommendations", aiRateLimiter, async (req: Request, res: Response) => {
   try {
-    const { profile, readingHistory, readWorks, interests, readingStyle, experienceLevel } = req.body;
+    const { readingHistory, readWorks, interests, readingStyle, experienceLevel } = req.body;
 
-    const worksList = readWorks || readingHistory || ["Vợ Nhặt", "Lão Hạc"];
-    const interestsList = interests || ["Con người", "Trưởng thành", "Bí ẩn"];
-    const style = readingStyle || experienceLevel || "Thích truyện ngắn, sâu lắng";
+    const worksList: string[] = (readWorks || readingHistory || ["Vợ Nhặt", "Lão Hạc"]).map(String);
+    const interestsList: string[] = (interests || ["Con người", "Trưởng thành", "Bí ẩn"]).map(String);
+    const style = String(readingStyle || experienceLevel || "Thích truyện ngắn, sâu lắng");
+
+    const cacheKey = `rec:${worksList.slice().sort().join("_")}:${interestsList.slice().sort().join("_")}`;
+    const cached = getCachedResult<any>(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
 
     const defaultRecommendations = [
       {
@@ -1209,6 +1584,10 @@ app.post("/api/recommendations", async (req: Request, res: Response) => {
         quoteSnippet: "Lận đận đời bà biết mấy nắng mưa / Mấy chục năm rồi, đến tận bây giờ...",
       },
     ];
+
+    if ((req as any)._forceFallback) {
+      return res.json({ recommendations: defaultRecommendations });
+    }
 
     const prompt = `Bạn là Trí Tuệ Định Vị Ngân Hà của READVERSE.
 Dựa trên hồ sơ phi hành gia:
@@ -1254,7 +1633,9 @@ Lưu ý nghiêm ngặt:
           ponderQuestion: item.ponderQuestion || "Điều gì đọng lại sâu sắc nhất sau tác phẩm này?",
           quoteSnippet: item.quoteSnippet || "Trang sách là cánh cửa bước vào tâm hồn con người.",
         }));
-        return res.json({ recommendations: mapped });
+        const result = { recommendations: mapped };
+        setCachedResult(cacheKey, result, 3600);
+        return res.json(result);
       }
     }
 
@@ -1274,6 +1655,14 @@ Lưu ý nghiêm ngặt:
         },
       ],
     });
+  }
+});
+
+// Centralized API error middleware (catches all unhandled controller exceptions)
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  console.error("API Error caught by middleware:", err?.message || err);
+  if (!res.headersSent) {
+    res.status(500).json({ error: "Hệ thống đang điều chỉnh quỹ đạo. Vui lòng thử lại sau giây lát." });
   }
 });
 

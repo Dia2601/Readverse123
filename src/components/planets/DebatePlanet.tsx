@@ -3,6 +3,7 @@ import { Swords, Shield, Sparkles, Award, ArrowRight, Brain, Scale, RefreshCw, B
 import { DebateTopic, UserProfile } from "../../types";
 import { INITIAL_DEBATE_TOPICS, SUGGESTED_READING_WORKS } from "../../data/mockData";
 import { playPop, playSuccess, playTwinkle } from "../../utils/audio";
+import { apiFetch } from "../../utils/apiClient";
 
 interface DebatePlanetProps {
   user: UserProfile;
@@ -78,15 +79,28 @@ export const DebatePlanet: React.FC<DebatePlanetProps> = ({
     setIsGeneratingTopic(true);
     playTwinkle();
     try {
-      const res = await fetch("/api/debate/generate-topic", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ workTitle }),
-      });
-      const data = await res.json();
+      const fallbackTopicData = {
+        id: "fb-deb-" + Date.now(),
+        workRef: workTitle,
+        title: `Lựa chọn số phận trong ${workTitle}`,
+        dilemma: `Trong ${workTitle}, hành động then chốt của nhân vật là sự lựa chọn dũng cảm hay là biểu hiện của sự buông xuôi trước thời cuộc?`,
+        stanceA: "Đó là quyết định can đảm để giữ gìn nhân phẩm và tình cảm cốt lõi.",
+        stanceB: "Đó là sự đầu hàng bi kịch trước những áp bức nặng nề của hoàn cảnh.",
+      };
+
+      const data = await apiFetch<any>(
+        "/api/debate/generate-topic",
+        {
+          method: "POST",
+          body: JSON.stringify({ workTitle }),
+          cacheTtlMs: 30000,
+        },
+        fallbackTopicData
+      );
+
       if (data && data.dilemma) {
         const topic: DebateTopic = {
-          id: "dyn-deb-" + Date.now(),
+          id: data.id || "dyn-deb-" + Date.now(),
           workTitle: data.workRef || workTitle,
           title: data.title || `Tranh biện về ${workTitle}`,
           dilemma: data.dilemma,
@@ -97,18 +111,6 @@ export const DebatePlanet: React.FC<DebatePlanetProps> = ({
         setAvailableTopics((prev) => [topic, ...prev]);
         setSelectedTopic(topic);
       }
-    } catch {
-      const fallback: DebateTopic = {
-        id: "fb-deb-" + Date.now(),
-        workTitle: workTitle,
-        title: `Lựa chọn số phận trong ${workTitle}`,
-        dilemma: `Trong ${workTitle}, hành động then chốt của nhân vật là sự lựa chọn dũng cảm hay là biểu hiện của sự buông xuôi trước thời cuộc?`,
-        stanceA: "Đó là quyết định can đảm để giữ gìn nhân phẩm và tình cảm cốt lõi.",
-        stanceB: "Đó là sự đầu hàng bi kịch trước những áp bức nặng nề của hoàn cảnh.",
-        rounds: 3,
-      };
-      setAvailableTopics((prev) => [fallback, ...prev]);
-      setSelectedTopic(fallback);
     } finally {
       setIsGeneratingTopic(false);
     }
@@ -148,37 +150,33 @@ export const DebatePlanet: React.FC<DebatePlanetProps> = ({
     setPlayerInput("");
 
     try {
-      const res = await fetch("/api/debate/turn", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          topic: selectedTopic.dilemma,
-          round: currentRound,
-          playerPosition: chosenPosition === "A" ? selectedTopic.stanceA : selectedTopic.stanceB,
-          playerInput: submittedText,
-          history: updatedHistory,
-        }),
-      });
-      const data = await res.json();
+      const fallbackTurn = {
+        counterArgument: `Một góc nhìn phản biện: Nếu đứng ở lập trường ngược lại, có thể cho rằng nghịch cảnh quá lớn đã tước đoạt quyền tự do ý chí. Bạn có dẫn chứng hành động nào để bác bỏ điều này?`,
+        coachingTip: "Bổ sung dẫn chứng chi tiết về hành động của nhân vật.",
+      };
+
+      const data = await apiFetch<any>(
+        "/api/debate/turn",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            topic: selectedTopic.dilemma,
+            round: currentRound,
+            playerPosition: chosenPosition === "A" ? selectedTopic.stanceA : selectedTopic.stanceB,
+            playerInput: submittedText,
+            history: updatedHistory,
+          }),
+        },
+        fallbackTurn
+      );
 
       setDebateHistory((prev) => [
         ...prev,
         {
           round: currentRound + 1,
           speaker: "ai",
-          text: data.counterArgument,
-          tip: data.coachingTip,
-        },
-      ]);
-      setCurrentRound(currentRound + 1);
-    } catch {
-      setDebateHistory((prev) => [
-        ...prev,
-        {
-          round: currentRound + 1,
-          speaker: "ai",
-          text: `Một góc nhìn phản biện: Nếu đứng ở lập trường ngược lại, có thể cho rằng nghịch cảnh quá lớn đã tước đoạt quyền tự do ý chí. Bạn có dẫn chứng hành động nào để bác bỏ điều này?`,
-          tip: "Bổ sung dẫn chứng chi tiết về hành động của nhân vật.",
+          text: data.counterArgument || fallbackTurn.counterArgument,
+          tip: data.coachingTip || fallbackTurn.coachingTip,
         },
       ]);
       setCurrentRound(currentRound + 1);
@@ -194,17 +192,30 @@ export const DebatePlanet: React.FC<DebatePlanetProps> = ({
     playTwinkle();
 
     try {
-      const res = await fetch("/api/debate/conclude", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          topic: selectedTopic.dilemma,
-          playerPosition: chosenPosition === "A" ? selectedTopic.stanceA : selectedTopic.stanceB,
-          history: debateHistory,
-          roundsCount: currentRound - 1,
-        }),
-      });
-      const data = await res.json();
+      const fallbackConclusion = {
+        logicScore: 88,
+        perspectiveScore: 92,
+        empathyScore: 90,
+        badge: "Hiệp Sĩ Đa Chiều",
+        synthesis: "Tranh biện xuất sắc! Bạn đã bảo vệ quan điểm vững vàng đồng thời thể hiện sự thấu cảm cao đối với góc nhìn đối lập.",
+        strengths: "Lập luận mạch lạc, tôn trọng sự phức tạp của nhân vật văn học.",
+        growthAreas: "Tiếp tục liên hệ thêm với bối cảnh xã hội ngày nay.",
+      };
+
+      const data = await apiFetch<any>(
+        "/api/debate/conclude",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            topic: selectedTopic.dilemma,
+            playerPosition: chosenPosition === "A" ? selectedTopic.stanceA : selectedTopic.stanceB,
+            history: debateHistory,
+            roundsCount: currentRound - 1,
+          }),
+        },
+        fallbackConclusion
+      );
+
       setFinalConclusion(data);
       playSuccess();
 
@@ -216,24 +227,6 @@ export const DebatePlanet: React.FC<DebatePlanetProps> = ({
         `Đấu trí tranh biện: ${selectedTopic.workTitle}`,
         avgScore,
         data.badge || "Hiệp Sĩ Đa Chiều",
-        "debate"
-      );
-    } catch {
-      const fallback = {
-        logicScore: 88,
-        perspectiveScore: 92,
-        empathyScore: 90,
-        badge: "Hiệp Sĩ Đa Chiều",
-        synthesis: "Tranh biện xuất sắc! Bạn đã bảo vệ quan điểm vững vàng đồng thời thể hiện sự thấu cảm cao đối với góc nhìn đối lập.",
-        strengths: "Lập luận mạch lạc, tôn trọng sự phức tạp của nhân vật văn học.",
-        growthAreas: "Tiếp tục liên hệ thêm với bối cảnh xã hội ngày nay.",
-      };
-      setFinalConclusion(fallback);
-      playSuccess();
-      onActivityComplete(
-        `Đấu trí tranh biện: ${selectedTopic.workTitle}`,
-        90,
-        "Hiệp Sĩ Đa Chiều",
         "debate"
       );
     } finally {

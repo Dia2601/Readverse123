@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Sparkles, MessageCircle, X, Send, Lightbulb, Compass, Brain } from "lucide-react";
 import { playPop, playTwinkle } from "../utils/audio";
+import { apiFetch } from "../utils/apiClient";
 
 interface KomiCompanionProps {
   astronautName: string;
@@ -43,18 +44,26 @@ export const KomiCompanion: React.FC<KomiCompanionProps> = ({
     if (!customPrompt) setInputText("");
     setIsLoading(true);
 
+    const fallbackReply = {
+      reply: `Một câu hỏi rất sắc sảo! Bạn thử suy ngẫm xem: nếu đổi góc nhìn từ nhân vật chính sang một người ngoài cuộc chứng kiến, ý nghĩa câu chuyện sẽ thay đổi ra sao?`,
+    };
+
     try {
-      const res = await fetch("/api/companion/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: textToSend,
-          context: contextText,
-          astronautName: astronautName || "Phi hành gia",
-          currentPlanet: currentPlanetName,
-        }),
-      });
-      const data = await res.json();
+      const data = await apiFetch<{ reply: string }>(
+        "/api/companion/chat",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            message: textToSend,
+            context: contextText,
+            astronautName: astronautName || "Phi hành gia",
+            currentPlanet: currentPlanetName,
+          }),
+          timeoutMs: 10000,
+        },
+        fallbackReply
+      );
+
       setMessages([
         ...newMessages,
         {
@@ -67,7 +76,7 @@ export const KomiCompanion: React.FC<KomiCompanionProps> = ({
         ...newMessages,
         {
           sender: "komi",
-          text: `Một câu hỏi rất sắc sảo! Bạn thử suy ngẫm xem: nếu đổi góc nhìn từ nhân vật chính sang một người ngoài cuộc chứng kiến, ý nghĩa câu chuyện sẽ thay đổi ra sao?`,
+          text: fallbackReply.reply,
         },
       ]);
     } finally {

@@ -1,4 +1,5 @@
 import { CreativePerspective, PerspectiveComment } from "../types";
+import { apiFetch, invalidateApiCache } from "./apiClient";
 
 const LOCAL_PERSPECTIVES_KEY = "readverse_creative_perspectives_v1";
 const LOCAL_BOOKMARKS_KEY = "readverse_bookmarked_perspectives_v1";
@@ -61,50 +62,54 @@ export function togglePerspectiveBookmark(id: string): boolean {
 
 // Fetch all public perspectives from server + merge with local public ones
 export async function fetchPublicPerspectives(): Promise<CreativePerspective[]> {
-  try {
-    const res = await fetch("/api/creative-perspectives");
-    if (res.ok) {
-      const serverList: CreativePerspective[] = await res.json();
-      // Also get any local public perspectives that may not yet be on server
-      const localList = getLocalPerspectives().filter((p) => p.visibility === "public");
-      const map = new Map<string, CreativePerspective>();
-      
-      serverList.forEach((p) => map.set(p.id, p));
-      localList.forEach((p) => {
-        if (!map.has(p.id)) {
-          map.set(p.id, p);
-        }
-      });
+  const localList = getLocalPerspectives().filter((p) => p.visibility === "public");
 
-      return Array.from(map.values());
-    }
+  try {
+    const serverList = await apiFetch<CreativePerspective[]>(
+      "/api/creative-perspectives",
+      {
+        method: "GET",
+        cacheTtlMs: 10000, // 10s memory cache for perspectives feed
+      },
+      []
+    );
+
+    const map = new Map<string, CreativePerspective>();
+    serverList.forEach((p) => map.set(p.id, p));
+    localList.forEach((p) => {
+      if (!map.has(p.id)) {
+        map.set(p.id, p);
+      }
+    });
+
+    return Array.from(map.values());
   } catch (e) {
     console.warn("Could not fetch remote perspectives, falling back to local:", e);
+    return localList;
   }
-
-  // Fallback to local public perspectives
-  return getLocalPerspectives().filter((p) => p.visibility === "public");
 }
 
 // Publish or update perspective
 export async function syncPerspectiveToServer(item: CreativePerspective): Promise<CreativePerspective> {
   // Always save locally first
   saveLocalPerspective(item);
+  invalidateApiCache("/api/creative-perspectives");
 
   try {
-    const res = await fetch("/api/creative-perspectives", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(item),
-    });
-    if (res.ok) {
-      const synced = await res.json();
-      saveLocalPerspective(synced);
-      return synced;
-    }
+    const synced = await apiFetch<CreativePerspective>(
+      "/api/creative-perspectives",
+      {
+        method: "POST",
+        body: JSON.stringify(item),
+        timeoutMs: 12000,
+      },
+      item
+    );
+
+    saveLocalPerspective(synced);
+    return synced;
   } catch (e) {
     console.warn("Server sync error (saved locally):", e);
+    return item;
   }
-
-  return item;
 }

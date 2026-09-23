@@ -21,6 +21,7 @@ import {
   saveLocalPerspective,
 } from "../../utils/perspectiveManager";
 import { playPop, playSuccess, playTwinkle } from "../../utils/audio";
+import { apiFetch } from "../../utils/apiClient";
 
 interface PerspectiveDetailViewProps {
   perspective: CreativePerspective;
@@ -60,22 +61,23 @@ export const PerspectiveDetailView: React.FC<PerspectiveDetailViewProps> = ({
 
   // Fetch AI comment starters
   useEffect(() => {
-    fetch("/api/create/comment-starters", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        perspectiveTitle: data.title,
-        originalWork: data.originalWorkTitle,
-        introduction: data.introduction,
-      }),
-    })
-      .then((res) => res.json())
-      .then((resData) => {
-        if (Array.isArray(resData?.starters)) {
-          setCommentStarters(resData.starters);
-        }
-      })
-      .catch((e) => console.warn("Could not load comment starters:", e));
+    apiFetch<{ starters: any[] }>(
+      "/api/create/comment-starters",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          perspectiveTitle: data.title,
+          originalWork: data.originalWorkTitle,
+          introduction: data.introduction,
+        }),
+        cacheTtlMs: 60000,
+      },
+      { starters: [] }
+    ).then((resData) => {
+      if (Array.isArray(resData?.starters) && resData.starters.length > 0) {
+        setCommentStarters(resData.starters);
+      }
+    });
   }, [data.id]);
 
   // Handle empathy toggle: "♡ Mình cũng từng nghĩ vậy"
@@ -99,14 +101,17 @@ export const PerspectiveDetailView: React.FC<PerspectiveDetailViewProps> = ({
     saveLocalPerspective(updated);
 
     try {
-      await fetch(`/api/creative-perspectives/${data.id}/interact`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "empathy",
-          userId: currentUser.id,
-        }),
-      });
+      await apiFetch<any>(
+        `/api/creative-perspectives/${data.id}/interact`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            action: "empathy",
+            userId: currentUser.id,
+          }),
+        },
+        null
+      );
     } catch (e) {
       console.warn("Empathy sync error:", e);
     }
@@ -145,16 +150,19 @@ export const PerspectiveDetailView: React.FC<PerspectiveDetailViewProps> = ({
     saveLocalPerspective(updated);
 
     try {
-      await fetch(`/api/creative-perspectives/${data.id}/interact`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "comment",
-          userName: currentUser.name || "Bạn đọc",
-          commentText: textToSend,
-          starterType: selectedStarter || "custom",
-        }),
-      });
+      await apiFetch<any>(
+        `/api/creative-perspectives/${data.id}/interact`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            action: "comment",
+            userName: currentUser.name || "Bạn đọc",
+            commentText: textToSend,
+            starterType: selectedStarter || "custom",
+          }),
+        },
+        null
+      );
     } catch (err) {
       console.warn("Comment sync error:", err);
     } finally {
@@ -173,14 +181,17 @@ export const PerspectiveDetailView: React.FC<PerspectiveDetailViewProps> = ({
     saveLocalPerspective(updated);
 
     try {
-      await fetch(`/api/creative-perspectives/${data.id}/visibility`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          visibility: nextVis,
-          authorId: currentUser.id,
-        }),
-      });
+      await apiFetch<any>(
+        `/api/creative-perspectives/${data.id}/visibility`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            visibility: nextVis,
+            authorId: currentUser.id,
+          }),
+        },
+        null
+      );
     } catch (e) {
       console.warn("Visibility toggle error:", e);
     }

@@ -3,6 +3,7 @@ import { Search, Compass, CheckCircle2, AlertCircle, Sparkles, Award, ArrowRight
 import { DetectiveCase, UserProfile } from "../../types";
 import { INITIAL_DETECTIVE_CASES, SUGGESTED_READING_WORKS } from "../../data/mockData";
 import { playPop, playSuccess, playTwinkle } from "../../utils/audio";
+import { apiFetch } from "../../utils/apiClient";
 
 interface InvestigatePlanetProps {
   user: UserProfile;
@@ -63,30 +64,7 @@ export const InvestigatePlanet: React.FC<InvestigatePlanetProps> = ({
     setIsGeneratingCase(true);
     playTwinkle();
     try {
-      const res = await fetch("/api/investigate/generate-case", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ workTitle }),
-      });
-      const data = await res.json();
-      if (data && data.claim) {
-        const generated: DetectiveCase = {
-          id: "dyn-case-" + Date.now(),
-          workTitle: data.workTitle || workTitle,
-          author: data.author || "Văn học",
-          claim: data.claim,
-          context: data.context || `Bối cảnh trong tác phẩm ${workTitle}`,
-          guidingClues: data.guidingClues || ["Phân tích tâm lý nhân vật", "Tìm kiếm chi tiết biểu tượng"],
-          suggestedEvidences: data.suggestedEvidences || [],
-          difficulty: "Vừa",
-        };
-        setAvailableCases((prev) => [generated, ...prev]);
-        setSelectedCase(generated);
-      }
-    } catch {
-      // Fallback custom case
-      const fallback: DetectiveCase = {
-        id: "fb-case-" + Date.now(),
+      const fallbackCaseData = {
         workTitle: workTitle,
         author: "Tác giả",
         claim: `Nhân vật chính trong "${workTitle}" hành động hoàn toàn do áp lực ngoại cảnh chứ không xuất phát từ bản tính.`,
@@ -99,10 +77,32 @@ export const InvestigatePlanet: React.FC<InvestigatePlanetProps> = ({
           `Chi tiết bước ngoặt lớn làm thay đổi số phận nhân vật trong "${workTitle}".`,
           `Khoảnh khắc nhân vật phải đưa ra lựa chọn khó khăn giữa tình cảm và trách nhiệm.`,
         ],
-        difficulty: "Vừa",
       };
-      setAvailableCases((prev) => [fallback, ...prev]);
-      setSelectedCase(fallback);
+
+      const data = await apiFetch<any>(
+        "/api/investigate/generate-case",
+        {
+          method: "POST",
+          body: JSON.stringify({ workTitle }),
+          cacheTtlMs: 30000,
+        },
+        fallbackCaseData
+      );
+
+      if (data && data.claim) {
+        const generated: DetectiveCase = {
+          id: data.id || "dyn-case-" + Date.now(),
+          workTitle: data.workTitle || workTitle,
+          author: data.author || "Văn học",
+          claim: data.claim,
+          context: data.context || `Bối cảnh trong tác phẩm ${workTitle}`,
+          guidingClues: data.guidingClues || ["Phân tích tâm lý nhân vật", "Tìm kiếm chi tiết biểu tượng"],
+          suggestedEvidences: data.suggestedEvidences || [],
+          difficulty: "Vừa",
+        };
+        setAvailableCases((prev) => [generated, ...prev]);
+        setSelectedCase(generated);
+      }
     } finally {
       setIsGeneratingCase(false);
     }
@@ -136,38 +136,38 @@ export const InvestigatePlanet: React.FC<InvestigatePlanetProps> = ({
     playTwinkle();
 
     try {
-      const res = await fetch("/api/investigate/evaluate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          claim: selectedCase.claim,
-          evidence: selectedEvidence,
-          reasoning: customReasoning,
-          workTitle: selectedCase.workTitle,
-        }),
-      });
-      const data = await res.json();
-      setEvaluationResult(data);
-      playSuccess();
-
-      // Only on successful AI evaluation is the activity completed!
-      onActivityComplete(
-        `Thẩm tra manh mối: ${selectedCase.workTitle}`,
-        Math.round((data.relevanceScore + data.strengthScore) / 2),
-        data.badgeEarned || "Thám Tử Trực Giác",
-        "investigate"
-      );
-    } catch {
-      const fallback = {
+      const fallbackEvaluation = {
         relevanceScore: 88,
         strengthScore: 84,
         feedback: `Dẫn chứng từ "${selectedCase.workTitle}" rất chuẩn xác! Lập luận của bạn đã làm sáng tỏ luận điểm. Bạn có thể phân tích thêm tâm lý nhân vật trước thời điểm này.`,
         missingPerspectives: "Cân nhắc thêm phản ứng của người xung quanh để thấy rõ sự cô độc.",
         badgeEarned: "Kính Lúp Tinh Tường",
       };
-      setEvaluationResult(fallback);
+
+      const data = await apiFetch<any>(
+        "/api/investigate/evaluate",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            claim: selectedCase.claim,
+            evidence: selectedEvidence,
+            reasoning: customReasoning,
+            workTitle: selectedCase.workTitle,
+          }),
+        },
+        fallbackEvaluation
+      );
+
+      setEvaluationResult(data);
       playSuccess();
-      onActivityComplete(`Thẩm tra manh mối: ${selectedCase.workTitle}`, 86, "Kính Lúp Tinh Tường", "investigate");
+
+      // Only on successful AI evaluation is the activity completed!
+      onActivityComplete(
+        `Thẩm tra manh mối: ${selectedCase.workTitle}`,
+        Math.round(((data.relevanceScore || 88) + (data.strengthScore || 84)) / 2),
+        data.badgeEarned || "Thám Tử Trực Giác",
+        "investigate"
+      );
     } finally {
       setIsSubmitting(false);
     }
